@@ -1,0 +1,409 @@
+// src/lib/drivelogicSmart.ts
+// Extracted smart payment + distance logic used by the DriveLogic UI and (optionally) MotorMind chat.
+
+import { BASE_APR, TERM_CAPS, aprAdjust, getBand, monthlyPayment, CreditTier, isColoradoZip } from "@/lib/finance";
+
+export type { CreditTier };
+
+export type VehicleBand = "A" | "B" | "C" | "D";
+export type Body = "SUV" | "Truck" | "Car" | "Van";
+
+export type Origin = { lat: number; lon: number };
+
+export type Vehicle = {
+  vin: string;
+  year: number;
+  make: string;
+  model: string;
+  trim?: string;
+  miles: number;
+  price: number;
+  body: Body;
+  img?: string;
+  lat: number;
+  lon: number;
+  city: string;
+  state: string;
+  dealer: string;
+  updated_at?: string;
+};
+
+export type RawVehicle = {
+  vin: string;
+  year: number | string;
+  make: string;
+  model: string;
+  trim?: string | null;
+  miles?: number | string | null;
+  price?: number | string | null;
+  body?: string | null;
+  photo?: string | null;
+  gallery?: string[] | null;
+  city?: string | null;
+  state?: string | null;
+  lat?: number | null;
+  lon?: number | null;
+  dealer?: string | null;
+  updated_at?: string | null;
+};
+
+// --- Minimal ZIP DB (extend later) ---
+export const ZIP_DB: Record<string, { lat: number; lon: number; state: string; city?: string }> = {
+  "80751": { lat: 40.625, lon: -103.207, state: "CO", city: "Sterling" },
+  "80202": { lat: 39.752, lon: -104.999, state: "CO", city: "Denver" },
+  "80903": { lat: 38.838, lon: -104.822, state: "CO", city: "Colorado Springs" },
+};
+
+export function zipToOrigin(zip: string, fallbackZip = "80751"): { origin: Origin; state?: string; city?: string } {
+  const rec = ZIP_DB[zip] ?? ZIP_DB[fallbackZip];
+  return { origin: { lat: rec.lat, lon: rec.lon }, state: rec.state, city: rec.city };
+}
+
+// --- Distance ---
+function toRad(d: number) {
+  return (d * Math.PI) / 180;
+}
+
+export function haversineMiles(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 3958.7613;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// --- State APR caps (demo) ---
+const STATE_CAPS: Record<string, { apr_cap: number; label: string }> = {
+  CO: { apr_cap: 0.21, label: "Colorado cap 21%" },
+};
+
+export function applyStateCap(apr: number, zip: string) {
+  if (isColoradoZip(zip)) {
+    const cap = STATE_CAPS.CO.apr_cap;
+    return { apr: Math.min(apr, cap), state: "CO", cap, label: STATE_CAPS.CO.label };
+  }
+  return { apr, state: undefined as string | undefined, cap: undefined as number | undefined, label: undefined as string | undefined };
+}
+
+// --- Normalization ---
+function toNum(x: unknown): number {
+  if (typeof x === "number") return x;
+  if (typeof x === "string") {
+    const cleaned = x.replace(/[^0-9.]/g, "");
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+function toBody(x: unknown): Body {
+  const s = String(x ?? "").toLowerCase();
+  if (s.includes("truck")) return "Truck";
+  if (s.includes("van")) return "Van";
+  if (s.includes("car") || s.includes("sedan") || s.includes("coupe")) return "Car";
+  return "SUV";
+}
+
+export function normalizeVehicle(r: RawVehicle, fallbackZip = "80751"): Vehicle {
+  const fallback = ZIP_DB[fallbackZip];
+  return {
+    vin: r.vin,
+    year: toNum(r.year),
+    make: r.make,
+    model: r.model,
+    trim: r.trim || undefined,
+    miles: toNum(r.miles ?? 0),
+    price: toNum(r.price ?? 0),
+    body: toBody(r.body),
+    img: r.photo || (Array.isArray(r.gallery) ? r.gallery[0] : undefined),
+    city: r.city ?? fallback.city ?? "Sterling",
+    state: r.state ?? fallback.state ?? "CO",
+    lat: typeof r.lat === "number" ? r.lat : fallback.lat,
+    lon: typeof r.lon === "number" ? r.lon : fallback.lon,
+    dealer: r.dealer ?? "Korf Motors",
+    updated_at: r.updated_at ?? undefined,
+  };
+}
+
+export type PaymentRange = { term: number; pmtLow: number; pmtHigh: number };
+
+export type SmartPaymentResult = {
+  band: VehicleBand;
+  age: number;
+  capInfo: { apr: number; state?: string; cap?: number; label?: string };
+  amountFinanced: number;
+  ltv: number;
+  aprLow: number;
+  aprHigh: number;
+  payments: PaymentRange[];
+  best: PaymentRange;
+  bestDiff: number;
+  withinBand: boolean;
+};
+
+export type SmartPaymentInputs = {
+  vehicle: Vehicle;
+  origin: Origin;
+  zip: string;
+  creditTier: CreditTier;
+  targetPmt: number;
+  down: number;
+  tradeEq: number;
+  negEq: number;
+  fees: number;
+  taxRate: number;
+};
+
+export function getSmartPaymentForVehicle(i: SmartPaymentInputs): SmartPaymentResult {
+  const { vehicle: v, zip, creditTier: tier, targetPmt, down, tradeEq, negEq, fees, taxRate } = i;
+
+  const band = getBand(v.year, v.miles) as VehicleBand;
+  let maxTerm = TERM_CAPS[band][tier];
+  const age = new Date().getFullYear() - v.year;
+
+  const taxableBase = Math.max(v.price - tradeEq + negEq, 0);
+  const tax = taxableBase * taxRate;
+  const amountFinanced = v.price + tax + fees - down - tradeEq + negEq;
+  const ltv = amountFinanced / Math.max(v.price - tradeEq + negEq, 1);
+
+  // Small lender-style guardrails (same as your demo)
+  if (maxTerm >= 84 && amountFinanced < 25000) maxTerm = 75;
+  if (maxTerm >= 72 && amountFinanced < 18000) maxTerm = Math.min(maxTerm, 66);
+  if (ltv > 1.25) maxTerm = Math.max(36, maxTerm - 6);
+
+  const base = BASE_APR[band][tier];
+  let apr = base + aprAdjust({ ltv, miles: v.miles, age, isOldEV: v.make === "Tesla" && age > 6 });
+  const capInfo = applyStateCap(apr, zip);
+  apr = capInfo.apr;
+
+  const aprLow = Math.max(apr - 0.01, 0.0299);
+  const aprHigh = Math.min(apr + 0.015, 0.2999);
+  const terms = Array.from(new Set([maxTerm, maxTerm - 6, maxTerm - 12].filter((m) => m >= 36))).sort((a, b) => a - b);
+
+  const payments: PaymentRange[] = terms.map((m) => ({
+    term: m,
+    pmtLow: monthlyPayment(amountFinanced, aprLow, m),
+    pmtHigh: monthlyPayment(amountFinanced, aprHigh, m),
+  }));
+
+  const best = payments.reduce(
+    (acc, p) => {
+      const mid = (p.pmtLow + p.pmtHigh) / 2;
+      const diff = Math.abs(mid - targetPmt);
+      return diff < acc.diff ? { diff, p } : acc;
+    },
+    { diff: Infinity, p: payments[0] }
+  );
+
+  const withinBand = payments.some((p) => targetPmt >= p.pmtLow && targetPmt <= p.pmtHigh);
+
+  return {
+    band,
+    age,
+    capInfo,
+    amountFinanced,
+    ltv,
+    aprLow,
+    aprHigh,
+    payments,
+    best: best.p,
+    bestDiff: best.diff,
+    withinBand,
+  };
+}
+
+// --- Core estimator (single vehicle) ---
+export type DriveLogicEstimateInput = {
+  vehicle: Pick<Vehicle, "year" | "miles" | "price" | "make" | "lat" | "lon" | "body">;
+  origin: Origin;
+  zip: string;
+  creditTier: CreditTier;
+  targetPmt: number;
+  down: number;
+  tradeEq: number;
+  negEq: number;
+  fees: number;
+  taxRate: number;
+};
+
+export type TermPayment = {
+  term: number;
+  pmtLow: number;
+  pmtHigh: number;
+};
+
+export type DriveLogicEstimate = {
+  dist: number;
+  band: VehicleBand;
+  capInfo: { apr: number; state?: string; cap?: number; label?: string };
+  amountFinanced: number;
+  taxableBase: number;
+  tax: number;
+  ltv: number;
+  maxTerm: number;
+  aprLow: number;
+  aprHigh: number;
+  payments: TermPayment[];
+  best: TermPayment;
+  withinBand: boolean;
+};
+
+export function estimateDriveLogicForVehicle(input: DriveLogicEstimateInput): DriveLogicEstimate {
+  const v = input.vehicle;
+
+  const dist = haversineMiles(input.origin.lat, input.origin.lon, v.lat, v.lon);
+
+  const band = getBand(v.year, v.miles) as VehicleBand;
+  let maxTerm = TERM_CAPS[band][input.creditTier];
+
+  const age = new Date().getFullYear() - v.year;
+
+  // CO note: trade equity reduces taxable base in many states; keep your existing rule here.
+  const taxableBase = Math.max(v.price - input.tradeEq + input.negEq, 0);
+  const tax = taxableBase * input.taxRate;
+
+  const amountFinanced = v.price + tax + input.fees - input.down - input.tradeEq + input.negEq;
+  const ltv = amountFinanced / Math.max(v.price - input.tradeEq + input.negEq, 1);
+
+  // guardrails
+  if (maxTerm >= 84 && amountFinanced < 25000) maxTerm = 75;
+  if (maxTerm >= 72 && amountFinanced < 18000) maxTerm = Math.min(maxTerm, 66);
+  if (ltv > 1.25) maxTerm = Math.max(36, maxTerm - 6);
+
+  const base = BASE_APR[band][input.creditTier];
+  let apr = base + aprAdjust({ ltv, miles: v.miles, age, isOldEV: v.make === "Tesla" && age > 6 });
+
+  const capInfo = applyStateCap(apr, input.zip);
+  apr = capInfo.apr;
+
+  const aprLow = Math.max(apr - 0.01, 0.0299);
+  const aprHigh = Math.min(apr + 0.015, 0.2999);
+
+  const terms = Array.from(
+    new Set([maxTerm, maxTerm - 6, maxTerm - 12].filter((m) => m >= 36))
+  ).sort((a, b) => a - b);
+
+  const payments: TermPayment[] = terms.map((m) => ({
+    term: m,
+    pmtLow: monthlyPayment(amountFinanced, aprLow, m),
+    pmtHigh: monthlyPayment(amountFinanced, aprHigh, m),
+  }));
+
+  const best = payments.reduce(
+    (acc, p) => {
+      const mid = (p.pmtLow + p.pmtHigh) / 2;
+      const diff = Math.abs(mid - input.targetPmt);
+      return diff < acc.diff ? { diff, p } : acc;
+    },
+    { diff: Infinity, p: payments[0] }
+  ).p;
+
+  const withinBand = payments.some(
+    (p) => input.targetPmt >= p.pmtLow && input.targetPmt <= p.pmtHigh
+  );
+
+  return {
+    dist,
+    band,
+    capInfo,
+    amountFinanced,
+    taxableBase,
+    tax,
+    ltv,
+    maxTerm,
+    aprLow,
+    aprHigh,
+    payments,
+    best,
+    withinBand,
+  };
+}
+
+// Convenience: estimate list for UI
+export function estimateAndRankVehicles(args: {
+  vehicles: Vehicle[];
+  zip: string;
+  origin: Origin;
+  creditTier: CreditTier;
+  targetPmt: number;
+  down: number;
+  tradeEq: number;
+  negEq: number;
+  fees: number;
+  taxRate: number;
+  radiusMiles: number;
+  bodies: Body[];
+}) {
+  return args.vehicles
+    .map((v) => {
+      const est = estimateDriveLogicForVehicle({
+        vehicle: v,
+        origin: args.origin,
+        zip: args.zip,
+        creditTier: args.creditTier,
+        targetPmt: args.targetPmt,
+        down: args.down,
+        tradeEq: args.tradeEq,
+        negEq: args.negEq,
+        fees: args.fees,
+        taxRate: args.taxRate,
+      });
+      return { v, ...est };
+    })
+    .filter((row) => args.bodies.includes(row.v.body))
+    .filter((row) => row.dist <= args.radiusMiles)
+    .sort((a, b) => {
+      const aMid = (a.best.pmtLow + a.best.pmtHigh) / 2;
+      const bMid = (b.best.pmtLow + b.best.pmtHigh) / 2;
+      const aDiff = Math.abs(aMid - args.targetPmt);
+      const bDiff = Math.abs(bMid - args.targetPmt);
+      if (aDiff !== bDiff) return aDiff - bDiff;
+      return a.dist - b.dist;
+    });
+}
+
+// Lightweight wrapper used by the UI page.
+export function getSmartPaymentForVehicle(input: {
+  vehicle: Vehicle;
+  origin: Origin;
+  zip: string;
+  creditTier: CreditTier;
+  targetPmt: number;
+  down: number;
+  tradeEq: number;
+  negEq: number;
+  fees: number;
+  taxRate: number;
+}) {
+  const est = estimateDriveLogicForVehicle({
+    vehicle: input.vehicle,
+    origin: input.origin,
+    zip: input.zip,
+    creditTier: input.creditTier,
+    targetPmt: input.targetPmt,
+    down: input.down,
+    tradeEq: input.tradeEq,
+    negEq: input.negEq,
+    fees: input.fees,
+    taxRate: input.taxRate,
+  });
+
+  const age = new Date().getFullYear() - input.vehicle.year;
+  const bestMid = (est.best.pmtLow + est.best.pmtHigh) / 2;
+  const bestDiff = Math.abs(bestMid - input.targetPmt);
+
+  return {
+    band: est.band,
+    age,
+    capInfo: est.capInfo,
+    amountFinanced: est.amountFinanced,
+    aprLow: est.aprLow,
+    aprHigh: est.aprHigh,
+    payments: est.payments,
+    best: est.best,
+    withinBand: est.withinBand,
+    bestDiff,
+  };
+}

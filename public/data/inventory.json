@@ -1,0 +1,50 @@
+[
+  {
+    "vin": "1C4RJFBG0FC000001",
+    "year": 2021,
+    "make": "Jeep",
+    "model": "Grand Cherokee",
+    "trim": "Laredo E",
+    "miles": 52000,
+    "price": 28995,
+    "body": "SUV",
+    "photo": null,
+    "city": "Fort Morgan",
+    "state": "CO",
+    "lat": 40.2503,
+    "lon": -103.8049,
+    "dealer": "Korf CDJR Fort Morgan"
+  },
+  {
+    "vin": "1C6SRFJT0MN000002",
+    "year": 2022,
+    "make": "Ram",
+    "model": "1500",
+    "trim": "Big Horn",
+    "miles": 34000,
+    "price": 39995,
+    "body": "Truck",
+    "photo": null,
+    "city": "Sterling",
+    "state": "CO",
+    "lat": 40.625,
+    "lon": -103.207,
+    "dealer": "Korf CDJR Fort Morgan"
+  },
+  {
+    "vin": "2C3CDAMP3TR000003",
+    "year": 2026,
+    "make": "Dodge",
+    "model": "Charger",
+    "trim": "Scat Pack AWD",
+    "miles": 15,
+    "price": 67584,
+    "body": "Car",
+    "photo": null,
+    "city": "Fort Morgan",
+    "state": "CO",
+    "lat": 40.2503,
+    "lon": -103.8049,
+    "dealer": "Korf CDJR Fort Morgan"
+  }
+]
